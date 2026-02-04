@@ -1,0 +1,543 @@
+## **Enhanced Skewness Momentum**
+
+In finance, momentum is the empirically observed tendency for rising asset prices or securities return to rise further, and falling prices to keep falling.
+The idea is that a stock that performed well in the past is expected to continue performing well in the next period.
+The existence of momentum is a market anomaly, which finance theory struggles to explain. Behavioral finance theory has discovered that investors are not perfectly rational and are subject to various cognitive biases that influence their decision-making
+
+Skewness measures the asymmetry of returns. We can have positive skewness (many small losses and occasional large gains) and negative skewness (many small gains and occasional large losses)
+
+In this project we want to put together momentum with skewness, using the cross-sectional approach.
+It's been documented a strong relation between expected skewness and cross-sectional momentum profits.
+
+Daniel and Moskowitz (2014) and Barroso and Santa-Clara (2015) showed that the returns of momentum investing are negatively skewed. Specifically, the return distribution of momentum is largely concentrated on the right side with fat tails.
+
+We download the file excel called SPX500, in particular the sheet about price daily, in order to have more information.
+
+S&P 500 (Standard and Poor's 500) is a stock market index tracking the stock performance of 500 leading companies listed on stock exchanges in the United States.
+
+### **Libraries**
+
+# --- Libraries Imports
+
+import google.colab
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import percentileofscore as score
+from statistics import mean
+from math import floor
+from scipy.stats import skew
+import warnings
+warnings.filterwarnings("ignore")
+
+
+### **Data Acquisition**
+
+google.colab.drive.mount('/content/drive')
+PROJECT_DIR = "/content/drive/MyDrive/financial_project/"
+
+# --- Download of the file
+
+sp500 = pd.read_excel(PROJECT_DIR + "SPX500 Original.xlsm", sheet_name='Price daily', skiprows=1)
+sp500 = pd.DataFrame(sp500)
+
+sp500
+
+The dataset has 7544 rows × 1356 columns
+
+### **Data Preparation**
+
+# --- Date format
+
+sp500["Dates"]= pd.to_datetime(sp500["Dates"], format="%d%m%Y")
+
+# --- Number of missing values
+
+missing=sp500.isnull().sum()
+pd.set_option('display.max_rows',None)
+
+Initially, we removed all stocks with at least one missing value, but this approach produced unsatisfactory results. We then decided to remove only those stocks for which all data were missing, as they added no information to the dataset.
+
+# --- Delete variables that have all missing values (all the values)
+
+sp500 = sp500.dropna(axis=1, how='all')
+
+We check then for duplicates and remove them:
+
+# --- Check for duplicates
+
+droplistdup = sp500.T[sp500.T.duplicated()].index.tolist()
+
+# --- Delete duplicates
+
+sp500.drop(droplistdup, axis=1, inplace=True)
+
+sp500
+
+Now our dataset has 7544 rows × 1279 columns
+
+# --- Convert ‘Dates’ to the DataFrame index to enable resampling and rolling calculations
+
+sp500 = sp500.set_index('Dates')
+
+### **Data Exploration**
+
+Here we can see the cumulative returns of a specific stock. This is helpful to see the performance of the companies under review.
+Example: 3M Co, Abbott Laboratories, Fortinet Inc, Linde PLC
+
+returns = sp500.pct_change().shift(-1)
+
+# Input: comma-separated list of companies
+inp = input("Insert the name of the companies (separated by comma): ")
+
+# Convert input string to list and clean spaces
+companies = [c.strip() for c in inp.split(",")]
+
+plt.figure(figsize=(14, 8))
+
+for company in companies:
+    if company not in returns.columns:
+        print(f"{company} Not found in the dataset")
+        continue
+
+    company_returns = returns[company]
+    cumulative_returns = (1 + company_returns).cumprod()
+
+    plt.plot(cumulative_returns, label=company)
+
+plt.title('Cumulative Returns of Selected Stocks')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend(title='Company', bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+### **Data Analysis**
+
+**Skewness Calculation**
+
+First of all we calculate the rolling skewness repeatedly over a moving window of past observations. In particular we use the log returns, because they are additive over time, reduce distortion from compounding, are scale-invariant, and provide more stable and comparable estimates across assets and periods.
+
+
+Log return formula:
+$$
+r_t = \ln\left(\frac{P_t}{P_{t-1}}\right)
+$$
+
+
+# --- Log returns calculation
+
+log_ret = np.log(sp500 / sp500.shift(1))
+log_ret = log_ret.dropna(how='all')
+
+# --- Estimation of skewness (window skew = 6 trading months)
+
+window_skew = 126 #252
+rolling_skew = log_ret.rolling(window=window_skew, min_periods=int(window_skew*0.5)).skew()
+
+Resampling from daily to monthly after calculating skewness smooths out noise, stabilizes the signal, and makes it compatible with monthly portfolio decisions, while preserving the most recent information.
+
+# --- Time frequency from daily to monthly data (skewness)
+
+monthly_skew = rolling_skew.resample("M").last() #resample months
+
+# --- Time frequency from daily to monthly data (prices)
+
+monthly_prices = sp500.resample("M").last()
+
+A ranking approach is employed because skewness is inherently noisy, ranking provides greater robustness, and it allows for cross-sectional comparisons.
+This explains why deciles—or, more generally, multiple classes—are typically used.
+
+# --- Decile ranking
+
+def assign_deciles(df, deciles=10):
+    def qcut_row(row):
+        if row.isna().all():
+            return pd.Series([np.nan]*len(row), index=row.index)
+        # rank to break ties then qcut
+        try:
+            ranks = row.rank(method='first')
+            labels = pd.qcut(ranks, q=deciles, labels=False, duplicates='drop') + 1
+            # qcut returns an array; map back to series aligned on columns
+            return pd.Series(labels, index=row.index)
+        except Exception:
+            # fallback: evenly assign by rank percentiles
+            pct = row.rank(pct=True)
+            bins = np.ceil(pct * deciles).fillna(np.nan).astype('float')
+            return pd.Series(bins, index=row.index)
+    return df.apply(qcut_row, axis=1)
+
+
+**Momentum Calculation**
+
+We decide to remove the last month of return from the analysis: this helps clean the indicators and improves the signal by minimizing the influence of short-term momentum and focusing on longer-term trends.
+
+lookback_period = 12
+momentum = (monthly_prices.shift(1) / monthly_prices.shift(12)) - 1
+
+For each month, the momentum of all assets is calculated and then converted into a percentile ranking across the cross-section. This produces a standardized measure between 0 and 1, where higher values indicate stronger recent performance. The ranking allows for robust comparison across assets and is used to construct deciles or portfolios for subsequent analysis.
+
+momentum_rank = momentum.rank(axis=1, pct=True)
+
+# Long leg Momentum
+
+In this section, we will be observing the top 10% of the momentum.
+
+
+
+**Momentum with skewness**
+
+Now we try our strategy: we put together skewness and momentum, assigning deciles on both. We want to select those stocks that have a very positive momentum (>0.9) and negative skewness (1 < skew_decile < 4). It reachs the best result!  
+
+# --- We use the function assign_deciles on skewness
+
+skew_decile = assign_deciles(monthly_skew, deciles=5)
+
+# --- Stocks with positive momentum and negative skewness
+
+signal = (
+    (momentum_rank > 0.9) &
+    (skew_decile >= 1) &
+    (skew_decile <= 4)
+)
+
+
+signal
+
+We calculate the next-month returns of all stocks and then aggregate the returns of those selected by the trading signal, using an equal-weighted approach. This procedure yields the realized monthly returns of the Enhanced Skewness Momentum strategy.
+
+# --- Calculate the returns of our strategy
+monthly_returns = monthly_prices.pct_change().shift(-1)  # next period returns
+selected_returns_sum = (signal.shift(1) * monthly_returns).sum(axis=1)
+num_active_stocks = signal.shift(1).sum(axis=1)
+num_active_stocks_for_division = num_active_stocks.replace(0, np.nan)
+strategy_returns = selected_returns_sum / num_active_stocks_for_division
+strategy_returns = strategy_returns.fillna(0)
+
+**Standard Momentum Strategy**
+
+To compare our strategy with both the market and the momentum, we first compute the returns for the momentum without skewness as well as the standard market returns. Once these are calculated, we determine the cumulative returns for all strategies.
+
+This approach allows us to visualize the effectiveness of our strategy in comparison to the market and to the momentum strategy without skewness.
+
+# --- calculate the signal of the standard momentum
+signal_msing = (momentum_rank>0.9).astype(int)
+
+# --- calculate the monthly returns and standard momentum's returns
+monthly_returns_msing = monthly_prices.pct_change().shift(-1)
+strategy_returns_msing = (signal_msing.shift(1) * monthly_returns_msing)
+strategy_returns_msing = strategy_returns_msing.sum(axis=1) / signal_msing.shift(1).sum(axis=1)
+strategy_returns_msing.fillna(0, inplace=True)
+
+# --- calculate the returns for the standard market
+benchmark_returns = monthly_returns.mean(axis=1)
+
+
+# --- calculate the cumulative returns for all three of the startegies
+cumulative_strategy = (1 + strategy_returns).cumprod()
+cumulative_momentum = (1 + strategy_returns_msing).cumprod()
+cumulative_benchmark = (1 + benchmark_returns).cumprod()
+
+**Plot of the Three Strategies**
+
+Here, we plot all three strategies side by side. Based on an equally weighted Enhanced Skewness Momentum strategy, we can observe that our strategy was able to outperform both the standard market strategy and the standard momentum strategy.
+
+This finding confirms previous studies, showing that the Enhanced Skewness Momentum strategy effectively surpasses the other strategies and delivers superior results.
+
+# --- plot the three strategies for a clear comparison
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12,6))
+plt.plot(cumulative_strategy, label='Skew-Momentum Strategy', linewidth=2)
+plt.plot(cumulative_benchmark, label='Benchmark', linestyle='--', linewidth=2)
+plt.plot(cumulative_momentum, label="Momentum Strategy", linestyle="-.", linewidth=2)
+plt.title('Cumulative Returns: Skew-Momentum Strategy vs Benchmark')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+**Plot of the Drawdown Graph**
+
+
+To better understand the results, we have also plotted a drawdown chart.
+
+A drawdown shows how much an investment falls after reaching a high point before it recovers again. A drawdown graph makes it easy to see how deep the losses are and how long the strategy takes to get back to previous highs.
+
+From what we can observe that the drawdown graph of the skewness-enhanced momentum strategy reveals mostly shallow and short-lived drawdowns, indicating stable performance during normal market conditions. However during the 2008/2009 financial crisis, the strategy experiences a pronounced drawdown where losses exceed 50%. This behavior is consistent with the well-documented crash risk associated with momentum-based strategies. Following major drawdowns, the strategy demonstrates a strong recovery and a capability of generating substantial long-term returns once market conditions normalize.
+
+# --- plot the drawdown of our strategy
+running_max = cumulative_strategy.cummax()
+drawdown = (cumulative_strategy - running_max) / running_max
+
+plt.figure(figsize=(12,4))
+plt.plot(drawdown, color='red', label='Drawdown')
+plt.title('Strategy Drawdown')
+plt.xlabel('Date')
+plt.ylabel('Drawdown')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --- define the function to calculate the following metrics: Annual Return, Annual Volatility, Sharpe Ratio, Sortino Ratio, Max Drawdown
+def calculate_metrics(series, freq=12):
+    series = series.dropna()
+
+    comp_ret = (1 + series).prod() - 1
+
+    ann_ret = series.mean() * freq
+    ann_vol = series.std() * np.sqrt(freq)
+
+    sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
+
+    downside_returns = series[series < 0]
+    downside_dev = downside_returns.std() * np.sqrt(freq)
+    sortino = ann_ret / downside_dev if downside_dev != 0 else 0
+
+    cum_ret = (1 + series).cumprod()
+    running_max = cum_ret.cummax()
+    drawdown = (cum_ret - running_max) / running_max
+    max_dd = drawdown.min()
+
+
+    return ann_ret, ann_vol, sharpe, sortino, max_dd
+
+
+**Metrics Calculation**
+
+We calculated key metrics to evaluate the strategy and understand its behavior relative to the benchmark and standard momentum strategy.
+
+First, the **Annual Return** of our strategy is the highest among the three, indicating that, over the long term, investors achieve better returns than by following the market or standard momentum.
+
+Next, looking at **Volatility**, our strategy exhibits moderate levels compared to the other strategies, which is more than compensated for by its higher annual returns.
+
+For the **Sharpe Ratio**, our strategy exceeds 1, demonstrating that the skewness-enhanced momentum strategy effectively rewards investors for the risk taken, outperforming the benchmark on a risk-adjusted basis while maintaining efficiency comparable to standard momentum.
+
+The **Sortino Ratio** refines the Sharpe Ratio by considering only downside volatility, thus providing a more appropriate measure of risk-adjusted performance for strategies with asymmetric return distributions, such as momentum-based portfolios. The Sortino Ratio exceeds the Sharpe Ratio, indicating that volatility is primarily driven by positive returns rather than downside risk.
+
+Finally, the strategy experiences a **Maximum Drawdown** of -53.03%, primarily during the 2008–2009 financial crisis. While this drawdown is larger than the benchmark’s, it is similar to that of standard momentum. Importantly, the strategy recovers strongly in the following years, indicating that losses are driven by rare market crashes rather than sustained underperformance.
+
+# --- Create the Final Table with all the metrics
+s_ann_ret, s_vol, s_sharpe, s_sortino, s_dd = calculate_metrics(strategy_returns)
+b_ann_ret, b_vol, b_sharpe, b_sortino, b_dd = calculate_metrics(benchmark_returns)
+m_ann_ret, m_vol, m_sharpe, m_sortino, m_dd = calculate_metrics(strategy_returns_msing)
+
+
+metrics_df = pd.DataFrame({
+    'Metric': ['Ann. Return','Ann. Volatility','Sharpe Ratio','Sortino Ratio','Max Drawdown'],
+    'Strategy (Rank Wgt)': [f"{s_ann_ret:.2%}", f"{s_vol:.2%}", f"{s_sharpe:.2f}", f"{s_sortino:.2f}",  f"{s_dd:.2%}"],
+    'Benchmark': [f"{b_ann_ret:.2%}", f"{b_vol:.2%}", f"{b_sharpe:.2f}", f"{b_sortino:.2f}", f"{b_dd:.2%}"],
+    'Standard Momentum': [f"{m_ann_ret:.2%}", f"{m_vol:.2%}", f"{m_sharpe:.2f}", f"{m_sortino:.2f}",  f"{m_dd:.2%}"]})
+
+print(metrics_df)
+
+# Rank-Weighted Skew-Momentum Portfolio
+
+To analyze changes in returns and metrics, we implemented a new weighting approach: **Rank-Weighted Skew-Momentum**.
+
+The main difference between this strategy and the previous one lies in the portfolio construction. In the previous strategy, stocks were equally weighted, giving each selected stock the same importance. In this strategy, however, we assign higher weights to stocks with stronger momentum, ranking them from highest to lowest and weighting the portfolio accordingly.
+
+This approach improves performance by increasing both annual returns, the Sharpe Ratio and the Sortino Ratio. A detailed analysis of these improvements will follow in the next sections.
+
+# --- Calculate Weights based on Rank of the momentum as well as the new returns of our strategy based on this ranking
+
+selected_momentum = momentum * signal
+selected_momentum = selected_momentum.replace(0, np.nan)
+
+ranks = selected_momentum.rank(axis=1, method='first')
+
+
+rank_weights = ranks.div(ranks.sum(axis=1), axis=0).fillna(0) #We divide the rank by the sum of all the ranks so that no stock will ever recieve 100% of the money.
+
+strategy_returns = (rank_weights * monthly_returns).sum(axis=1)
+strategy_returns = strategy_returns.fillna(0)
+
+
+# Sum the weights across each row (month)
+# We only look at rows where we actually have weights
+weight_sums = rank_weights.sum(axis=1)
+
+# Filter out the early months where the strategy hadn't started yet (sum is 0)
+active_months = weight_sums[weight_sums > 0]
+
+print(weight_sums) #this is the sum of every date showing that it is equal to 1
+
+print(f"Avg of Weights:  {active_months.mean():.6f}") #and the average is also equal to 1
+
+cumulative_strategy = (1 + strategy_returns).cumprod()
+
+As shown in the graph, the Skew-Momentum Strategy significantly outperforms the standard Momentum Strategy in terms of cumulative returns, indicating that the Rank-Weighted Skew-Momentum portfolio delivers better performance and higher returns than an equally weighted portfolio.
+
+# --- plot the three strategies for a clear comparison
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12,6))
+plt.plot(cumulative_strategy, label='Skew-Momentum Strategy', linewidth=2)
+plt.plot(cumulative_benchmark, label='Benchmark', linestyle='--', linewidth=2)
+plt.plot(cumulative_momentum, label="Momentum Strategy", linestyle="-.", linewidth=2)
+plt.title('Cumulative Returns: Rank-Weighted Skew-Momentum')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+As previously mentioned, the metrics indicate an improvement in both Annual Return and Sharpe Ratio, even surpassing those of the standard Momentum Strategy.
+
+Specifically, the annual returns have increased by approximately 5% compared to the equally weighted portfolio, representing a meaningful improvement for investors.
+
+Additionally, the Sharpe Ratio has also improved, indicating that the strategy compensates investors more effectively for the risk taken.
+
+The Sortino Ratio has also increased, reflecting improved downside risk-adjusted performance and confirming that the increase in volatility is compensated by stronger positive returns.
+
+The other two metrics have increased slightly relative to the equally weighted portfolio, but this is balanced by the improvements in annual returns, Sharpe Ratio and the Sortino Ratio, resulting in an overall well-balanced strategy.
+
+# --- Create the Final Table with all the metrics
+s_ann_ret, s_vol, s_sharpe, s_sortino, s_dd = calculate_metrics(strategy_returns)
+b_ann_ret, b_vol, b_sharpe, b_sortino, b_dd = calculate_metrics(benchmark_returns)
+m_ann_ret, m_vol, m_sharpe, m_sortino, m_dd = calculate_metrics(strategy_returns_msing)
+
+
+metrics_df = pd.DataFrame({
+    'Metric': ['Ann. Return','Ann. Volatility','Sharpe Ratio','Sortino Ratio','Max Drawdown'],
+    'Strategy (Rank Wgt)': [f"{s_ann_ret:.2%}", f"{s_vol:.2%}", f"{s_sharpe:.2f}", f"{s_sortino:.2f}",  f"{s_dd:.2%}"],
+    'Benchmark': [f"{b_ann_ret:.2%}", f"{b_vol:.2%}", f"{b_sharpe:.2f}", f"{b_sortino:.2f}", f"{b_dd:.2%}"],
+    'Standard Momentum': [f"{m_ann_ret:.2%}", f"{m_vol:.2%}", f"{m_sharpe:.2f}", f"{m_sortino:.2f}",  f"{m_dd:.2%}"]})
+
+print(metrics_df)
+
+**Conclusion**
+
+The Skew-Momentum Strategy, particularly with rank-based weighting, outperforms both the standard Momentum Strategy and the market benchmark. It delivers higher annual returns and an improved Sharpe Ratio and Sortino Ratio, reflecting strong risk-adjusted performance.
+
+While drawdowns can be significant during extreme market events, the strategy demonstrates resilience and strong recovery, generating substantial long-term returns. Overall, rank-weighted Skew-Momentum provides an effective approach to enhance returns while maintaining a balanced risk profile.
+
+# Short leg Momentum
+
+In this section, we will be observing the lower 10% of the momentum and maintaing the same skewness as the long leg Momentum
+
+# --- Stocks with positive momentum and negative skewness
+
+signal = (
+    (momentum_rank < 0.1) &
+    (skew_decile >= 1) &
+    (skew_decile <= 4)
+)
+
+
+signal
+
+We calculate the next-month returns of all stocks and then aggregate the returns of those selected by the trading signal, using an equal-weighted approach. This procedure yields the realized monthly returns of the Enhanced Skewness Momentum strategy.
+
+# --- Calculate the returns of our strategy
+monthly_returns = monthly_prices.pct_change().shift(-1)  # next period returns
+selected_returns_sum = (signal.shift(1) * monthly_returns).sum(axis=1)
+num_active_stocks = signal.shift(1).sum(axis=1)
+num_active_stocks_for_division = num_active_stocks.replace(0, np.nan)
+strategy_returns = selected_returns_sum / num_active_stocks_for_division
+strategy_returns = strategy_returns.fillna(0)
+
+**Standard Momentum Strategy**
+
+To compare our strategy with both the market and the momentum, we first compute the returns for the momentum without skewness as well as the standard market returns. Once these are calculated, we determine the cumulative returns for all strategies.
+
+This approach allows us to visualize the effectiveness of our strategy in comparison to the market and to the momentum strategy without skewness.
+
+# --- calculate the signal of the standard momentum
+signal_msing = (momentum_rank<0.1).astype(int)
+
+# --- calculate the monthly returns and standard momentum's returns
+monthly_returns_msing = monthly_prices.pct_change().shift(-1)
+strategy_returns_msing = (signal_msing.shift(1) * monthly_returns_msing)
+strategy_returns_msing = strategy_returns_msing.sum(axis=1) / signal_msing.shift(1).sum(axis=1)
+strategy_returns_msing.fillna(0, inplace=True)
+
+# --- calculate the returns for the standard market
+benchmark_returns = monthly_returns.mean(axis=1)
+
+
+# --- calculate the cumulative returns for all three of the startegies
+cumulative_strategy = (1 + strategy_returns).cumprod()
+cumulative_momentum = (1 + strategy_returns_msing).cumprod()
+cumulative_benchmark = (1 + benchmark_returns).cumprod()
+
+**Plot of the Three Strategies**
+
+Here, we plot all three strategies side by side.
+
+# --- plot the three strategies for a clear comparison
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12,6))
+plt.plot(cumulative_strategy, label='Skew-Momentum Strategy', linewidth=2)
+plt.plot(cumulative_benchmark, label='Benchmark', linestyle='--', linewidth=2)
+plt.plot(cumulative_momentum, label="Momentum Strategy", linestyle="-.", linewidth=2)
+plt.title('Cumulative Returns: Skew-Momentum Strategy vs Benchmark')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+**Plot of the Drawdown Graph**
+
+
+To better understand the results, we have also plotted a drawdown chart.
+
+A drawdown shows how much an investment falls after reaching a high point before it recovers again. A drawdown graph makes it easy to see how deep the losses are and how long the strategy takes to get back to previous highs.
+
+From what we can observe that the drawdown graph of the skewness-enhanced momentum strategy reveals mostly shallow and short-lived drawdowns, indicating stable performance during normal market conditions. However during the 2008/2009 financial crisis, the strategy experiences a pronounced drawdown where losses exceed 70%. This behavior is consistent with the well-documented crash risk associated with momentum-based strategies.
+
+# --- plot the drawdown of our strategy
+running_max = cumulative_strategy.cummax()
+drawdown = (cumulative_strategy - running_max) / running_max
+
+plt.figure(figsize=(12,4))
+plt.plot(drawdown, color='red', label='Drawdown')
+plt.title('Strategy Drawdown')
+plt.xlabel('Date')
+plt.ylabel('Drawdown')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --- define the function to calculate the following metrics: Annual Return, Annual Volatility, Sharpe Ratio, Sortino Ratio, Max Drawdown
+def calculate_metrics(series, freq=12):
+    series = series.dropna()
+
+    comp_ret = (1 + series).prod() - 1
+
+    ann_ret = series.mean() * freq
+    ann_vol = series.std() * np.sqrt(freq)
+
+    sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
+
+    downside_returns = series[series < 0]
+    downside_dev = downside_returns.std() * np.sqrt(freq)
+    sortino = ann_ret / downside_dev if downside_dev != 0 else 0
+
+    cum_ret = (1 + series).cumprod()
+    running_max = cum_ret.cummax()
+    drawdown = (cum_ret - running_max) / running_max
+    max_dd = drawdown.min()
+
+
+    return ann_ret, ann_vol, sharpe, sortino, max_dd
+
+
+**Metrics Calculation**
+
+
+# --- Create the Final Table with all the metrics
+s_ann_ret, s_vol, s_sharpe, s_sortino, s_dd = calculate_metrics(strategy_returns)
+b_ann_ret, b_vol, b_sharpe, b_sortino, b_dd = calculate_metrics(benchmark_returns)
+m_ann_ret, m_vol, m_sharpe, m_sortino, m_dd = calculate_metrics(strategy_returns_msing)
+
+
+metrics_df = pd.DataFrame({
+    'Metric': ['Ann. Return','Ann. Volatility','Sharpe Ratio','Sortino Ratio','Max Drawdown'],
+    'Strategy (Rank Wgt)': [f"{s_ann_ret:.2%}", f"{s_vol:.2%}", f"{s_sharpe:.2f}", f"{s_sortino:.2f}",  f"{s_dd:.2%}"],
+    'Benchmark': [f"{b_ann_ret:.2%}", f"{b_vol:.2%}", f"{b_sharpe:.2f}", f"{b_sortino:.2f}", f"{b_dd:.2%}"],
+    'Standard Momentum': [f"{m_ann_ret:.2%}", f"{m_vol:.2%}", f"{m_sharpe:.2f}", f"{m_sortino:.2f}",  f"{m_dd:.2%}"]})
+
+print(metrics_df)
